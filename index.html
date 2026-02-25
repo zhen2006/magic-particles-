@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D 魔法粒子 - 云端协作版</title>
+    <!-- 依赖库 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        :root {
+            --accent: #ff0055;
+            --bg-glass: rgba(20, 20, 20, 0.7);
+        }
+
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; touch-action: none; }
+        #canvas-container { width: 100vw; height: 100vh; }
+        
+        .input_video { display: none; }
+
+        #ui-panel {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: var(--bg-glass);
+            backdrop-filter: blur(15px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 15px;
+            border-radius: 15px;
+            color: white;
+            z-index: 100;
+            width: 200px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            pointer-events: auto;
+        }
+
+        h2 { margin: 0 0 10px 0; font-size: 16px; font-weight: 300; color: #aaa; }
+
+        .control-group { margin-bottom: 10px; }
+        label { display: block; margin-bottom: 5px; font-size: 10px; text-transform: uppercase; color: #888; }
+
+        select {
+            width: 100%;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.2);
+            padding: 6px;
+            border-radius: 8px;
+            color: white;
+            font-size: 12px;
+            outline: none;
+        }
+
+        #status-indicator {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 8px 16px;
+            background: rgba(0,0,0,0.6);
+            border-radius: 20px;
+            color: #44ffaa;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 100;
+            white-space: nowrap;
+        }
+
+        #loading-overlay {
+            position: fixed;
+            inset: 0;
+            background: #000;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 200;
+            color: white;
+        }
+        
+        .spinner {
+            width: 30px;
+            height: 30px;
+            border: 2px solid rgba(255,255,255,0.1);
+            border-top: 2px solid var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 15px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+    <div id="loading-overlay">
+        <div class="spinner"></div>
+        <p>正在初始化同步星域...</p>
+    </div>
+
+    <div id="ui-panel">
+        <h2>星域协作控制</h2>
+        <div class="control-group">
+            <label>魔法形态</label>
+            <select id="shape-select">
+                <option value="heart">爱心</option>
+                <option value="saturn" selected>土星</option>
+                <option value="firework">烟花</option>
+            </select>
+        </div>
+        <div style="font-size: 10px; color: #666; line-height: 1.4;">
+            • <b>协作模式</b>：所有人操作实时同步<br>
+            • <b>移动操控</b>：单指旋转，双指缩放<br>
+            • <b>分享链接</b>：让好友加入同一星域
+        </div>
+    </div>
+
+    <div id="status-indicator">正在连接云端...</div>
+    
+    <video class="input_video"></video>
+    <div id="canvas-container"></div>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getFirestore, doc, onSnapshot, setDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+
+        // --- 配置环境 ---
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'shared-saturn';
+
+        // --- Three.js 核心逻辑 ---
+        let scene, camera, renderer, particleSystem;
+        const particleCount = 12000;
+        const positions = new Float32Array(particleCount * 3);
+        const targetPositions = new Float32Array(particleCount * 3);
+        const colors = new Float32Array(particleCount * 3);
+        
+        let currentScale = 1.0;
+        let targetScale = 1.0;
+        let targetRotationX = 0;
+        let targetRotationY = 0;
+        let currentShape = 'saturn';
+
+        // 颜色定义
+        const GOLD_RGB = { r: 1.0, g: 0.84, b: 0.3 };
+        const WHITE_RGB = { r: 1.0, g: 1.0, b: 1.0 };
+        const DEFAULT_RGB = { r: 1.0, g: 0.05, b: 0.4 };
+
+        function createPointTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64; canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+            gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+            gradient.addColorStop(0.2, 'rgba(255, 255, 255, 0.8)');
+            gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+            ctx.fillStyle = gradient; ctx.fillRect(0, 0, 64, 64);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        const ShapeGenerators = {
+            heart: (i) => {
+                const t = Math.random() * Math.PI * 2;
+                const x = 16 * Math.pow(Math.sin(t), 3);
+                const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+                return [x * 0.4, y * 0.4, (Math.random() - 0.5) * 2];
+            },
+            saturn: (i) => {
+                const sphereRatio = 0.5;
+                if (i < particleCount * sphereRatio) {
+                    const n = particleCount * sphereRatio;
+                    const phi = Math.acos(1 - 2 * (i / n)) + (Math.random() - 0.5) * 0.2;
+                    const theta = (Math.PI * (1 + Math.sqrt(5)) * i) + (Math.random() - 0.5) * 0.5;
+                    const r = 5 + (Math.random() - 0.5) * 1.5;
+                    return [r * Math.cos(theta) * Math.sin(phi), r * Math.sin(theta) * Math.sin(phi), r * Math.cos(phi)];
+                } else {
+                    const angle = Math.random() * Math.PI * 2;
+                    const rand = Math.pow(Math.random(), 0.8);
+                    const radius = 6.5 + rand * 8.5;
+                    const zSpread = (Math.random() - 0.5) * 2.5 * (1.0 - (radius-6.5)/8.5);
+                    return [Math.cos(angle) * radius, Math.sin(angle) * radius, zSpread];
+                }
+            },
+            firework: (i) => {
+                const r = 8 + Math.random() * 2;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.random() * Math.PI;
+                return [r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi)];
+            }
+        };
+
+        function updateShapeTargets(shapeName) {
+            const colorAttr = particleSystem.geometry.attributes.color;
+            for (let i = 0; i < particleCount; i++) {
+                const [x, y, z] = ShapeGenerators[shapeName](i);
+                targetPositions[i * 3] = x;
+                targetPositions[i * 3 + 1] = y;
+                targetPositions[i * 3 + 2] = z;
+                const c = (shapeName === 'saturn') ? (i < particleCount * 0.5 ? GOLD_RGB : WHITE_RGB) : DEFAULT_RGB;
+                colorAttr.array[i * 3] = c.r; colorAttr.array[i * 3 + 1] = c.g; colorAttr.array[i * 3 + 2] = c.b;
+            }
+            colorAttr.needsUpdate = true;
+        }
+
+        // --- 同步逻辑 ---
+        async function syncToCloud() {
+            if (!auth.currentUser) return;
+            const stateRef = doc(db, 'artifacts', appId, 'public', 'data', 'worldState');
+            await setDoc(stateRef, {
+                rotationX: targetRotationX,
+                rotationY: targetRotationY,
+                scale: targetScale,
+                shape: currentShape,
+                updatedAt: Date.now()
+            }, { merge: true });
+        }
+
+        function initSync() {
+            const stateRef = doc(db, 'artifacts', appId, 'public', 'data', 'worldState');
+            onSnapshot(stateRef, (snapshot) => {
+                if (snapshot.exists()) {
+                    const data = snapshot.data();
+                    // 如果不是当前用户主动操作（简单节流判定），则更新本地
+                    targetRotationX = data.rotationX;
+                    targetRotationY = data.rotationY;
+                    targetScale = data.scale;
+                    if (currentShape !== data.shape) {
+                        currentShape = data.shape;
+                        document.getElementById('shape-select').value = currentShape;
+                        updateShapeTargets(currentShape);
+                    }
+                }
+            }, (error) => console.error("同步失败:", error));
+        }
+
+        // --- 交互逻辑 (Touch & Mouse) ---
+        let isDragging = false;
+        let lastTouchX, lastTouchY, lastDist;
+
+        function bindEvents() {
+            const container = window;
+            
+            // 鼠标/单指旋转
+            const onStart = (e) => {
+                isDragging = true;
+                const touch = e.touches ? e.touches[0] : e;
+                lastTouchX = touch.clientX; lastTouchY = touch.clientY;
+            };
+            const onMove = (e) => {
+                if (!isDragging) return;
+                const touch = e.touches ? e.touches[0] : e;
+                
+                // 处理双指缩放
+                if (e.touches && e.touches.length === 2) {
+                    const dx = e.touches[0].clientX - e.touches[1].clientX;
+                    const dy = e.touches[0].clientY - e.touches[1].clientY;
+                    const dist = Math.sqrt(dx*dx + dy*dy);
+                    if (lastDist) {
+                        targetScale *= (dist / lastDist);
+                        targetScale = Math.min(Math.max(targetScale, 0.2), 5);
+                    }
+                    lastDist = dist;
+                } else {
+                    targetRotationY += (touch.clientX - lastTouchX) * 0.01;
+                    targetRotationX += (touch.clientY - lastTouchY) * 0.01;
+                }
+                lastTouchX = touch.clientX; lastTouchY = touch.clientY;
+                syncToCloud(); // 操作时同步
+            };
+            const onEnd = () => { isDragging = false; lastDist = null; };
+
+            container.addEventListener('mousedown', onStart);
+            container.addEventListener('mousemove', onMove);
+            container.addEventListener('mouseup', onEnd);
+            container.addEventListener('touchstart', onStart, {passive: false});
+            container.addEventListener('touchmove', onMove, {passive: false});
+            container.addEventListener('touchend', onEnd);
+            
+            document.getElementById('shape-select').addEventListener('change', (e) => {
+                currentShape = e.target.value;
+                updateShapeTargets(currentShape);
+                syncToCloud();
+            });
+        }
+
+        function initThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera.position.z = 40;
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            const material = new THREE.PointsMaterial({
+                size: 0.3, transparent: true, opacity: 0.9,
+                blending: THREE.AdditiveBlending, depthWrite: false,
+                map: createPointTexture(), vertexColors: true
+            });
+            particleSystem = new THREE.Points(geometry, material);
+            scene.add(particleSystem);
+
+            updateShapeTargets('saturn');
+            
+            function animate() {
+                requestAnimationFrame(animate);
+                currentScale += (targetScale - currentScale) * 0.1;
+                particleSystem.scale.set(currentScale, currentScale, currentScale);
+                particleSystem.rotation.x += (targetRotationX - particleSystem.rotation.x) * 0.1;
+                particleSystem.rotation.y += (targetRotationY - particleSystem.rotation.y) * 0.1;
+                particleSystem.rotation.y += 0.001; // 常规自转
+
+                const posAttr = particleSystem.geometry.attributes.position;
+                for (let i = 0; i < particleCount * 3; i++) {
+                    posAttr.array[i] += (targetPositions[i] - posAttr.array[i]) * 0.08;
+                }
+                posAttr.needsUpdate = true;
+                renderer.render(scene, camera);
+            }
+            animate();
+        }
+
+        // --- 启动流程 ---
+        window.onload = async () => {
+            initThree();
+            bindEvents();
+            
+            // 认证与云端连接
+            try {
+                await signInAnonymously(auth);
+                document.getElementById('status-indicator').innerText = "☁️ 已连接云端星域";
+                initSync();
+            } catch (e) {
+                document.getElementById('status-indicator').innerText = "📴 本地模式 (同步不可用)";
+            }
+            
+            document.getElementById('loading-overlay').style.display = 'none';
+
+            // 同样支持 MediaPipe (如果手机性能允许)
+            const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+            hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5 });
+            hands.onResults((results) => {
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    const lm = results.multiHandLandmarks[0];
+                    targetRotationY += (lm[9].x - 0.5) * 0.1;
+                    targetRotationX += (lm[9].y - 0.5) * 0.1;
+                    syncToCloud();
+                }
+            });
+            const cameraModule = new Camera(document.querySelector('.input_video'), {
+                onFrame: async () => { await hands.send({image: document.querySelector('.input_video')}); },
+                width: 320, height: 240
+            });
+            cameraModule.start().catch(() => console.log("Camera inactive"));
+        };
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
